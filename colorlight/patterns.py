@@ -38,13 +38,24 @@ def _hsv_to_rgb(h: np.ndarray) -> np.ndarray:
     f = h6 - np.floor(h6)
 
     # S=1, V=1  →  p=0, q=1-f, t=f
-    z = np.zeros_like(h)
-    o = np.ones_like(h)
+    # Pre-compute values
+    one_minus_f = 1.0 - f
 
-    conds = [sector == k for k in range(6)]
-    r = np.select(conds, [o,     1 - f, z,     z,     f,     o    ])
-    g = np.select(conds, [f,     o,     o,     1 - f, z,     z    ])
-    b = np.select(conds, [z,     z,     f,     o,     o,     1 - f])
+    # Use where() for conditional assignment (faster than select for large arrays)
+    r = np.where(sector == 0, 1.0,
+         np.where(sector == 1, one_minus_f,
+         np.where(sector == 4, f,
+         np.where(sector == 5, 1.0, 0.0))))
+
+    g = np.where(sector == 0, f,
+         np.where(sector == 1, 1.0,
+         np.where(sector == 2, 1.0,
+         np.where(sector == 3, one_minus_f, 0.0))))
+
+    b = np.where(sector == 2, f,
+         np.where(sector == 3, 1.0,
+         np.where(sector == 4, 1.0,
+         np.where(sector == 5, one_minus_f, 0.0))))
 
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
@@ -80,10 +91,14 @@ class RainbowScroll(Pattern):
             np.linspace(0, 1, width, endpoint=False),
             (height, 1),
         )  # shape (H, W)
+        # Pre-allocate hue and output buffers
+        self._hue_buffer = np.empty((height, width), dtype=np.float32)
 
     def generate(self, t: float) -> np.ndarray:
-        hue = (self._base + t * 0.15) % 1.0
-        return _hsv_to_rgb(hue)
+        # Reuse pre-allocated buffer for hue calculation
+        np.add(self._base, t * 0.15, out=self._hue_buffer)
+        np.mod(self._hue_buffer, 1.0, out=self._hue_buffer)
+        return _hsv_to_rgb(self._hue_buffer)
 
 
 class DiagonalRainbow(Pattern):
@@ -95,10 +110,14 @@ class DiagonalRainbow(Pattern):
         y = np.linspace(0, 1, height, endpoint=False)
         xx, yy = np.meshgrid(x, y)
         self._base = (xx + yy) * 0.5   # (H, W)
+        # Pre-allocate hue buffer
+        self._hue_buffer = np.empty((height, width), dtype=np.float32)
 
     def generate(self, t: float) -> np.ndarray:
-        hue = (self._base + t * 0.12) % 1.0
-        return _hsv_to_rgb(hue)
+        # Reuse pre-allocated buffer for hue calculation
+        np.add(self._base, t * 0.12, out=self._hue_buffer)
+        np.mod(self._hue_buffer, 1.0, out=self._hue_buffer)
+        return _hsv_to_rgb(self._hue_buffer)
 
 
 class ColorBars(Pattern):
@@ -133,9 +152,12 @@ class BouncingSquare(Pattern):
     def __init__(self, width: int, height: int) -> None:
         super().__init__(width, height)
         self._size = max(8, min(width, height) // 6)
+        # Pre-allocate frame buffer to avoid allocation every frame
+        self._frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
     def generate(self, t: float) -> np.ndarray:
-        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        # Clear frame (reuse buffer)
+        self._frame.fill(0)
 
         # Lissajous-style bounce
         max_x = self.width - self._size
@@ -147,17 +169,24 @@ class BouncingSquare(Pattern):
         r, g, b = colorsys.hsv_to_rgb((t * 0.1) % 1.0, 1.0, 1.0)
         color = (int(r * 255), int(g * 255), int(b * 255))
 
-        frame[y : y + self._size, x : x + self._size] = color
-        return frame
+        self._frame[y : y + self._size, x : x + self._size] = color
+        return self._frame
 
 
 class SolidColor(Pattern):
     """Full-screen colour that cycles through the hue wheel."""
 
+    def __init__(self, width: int, height: int) -> None:
+        super().__init__(width, height)
+        # Pre-allocate frame buffer
+        self._frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
     def generate(self, t: float) -> np.ndarray:
         r, g, b = colorsys.hsv_to_rgb((t * 0.08) % 1.0, 1.0, 1.0)
         color = (int(r * 255), int(g * 255), int(b * 255))
-        return np.full((self.height, self.width, 3), color, dtype=np.uint8)
+        # Fill pre-allocated buffer instead of creating new array
+        self._frame[:] = color
+        return self._frame
 
 
 # ---------------------------------------------------------------------------

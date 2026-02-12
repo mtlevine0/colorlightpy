@@ -65,6 +65,19 @@ def _parse_args() -> argparse.Namespace:
         help="Brightness 0-255 (default: 255).",
     )
     parser.add_argument(
+        "--scan-mode",
+        choices=["sequential", "interlaced", "interlaced-32"],
+        default="sequential",
+        help=(
+            "Row scanning mode for LED panels with multiplexing.  "
+            "sequential: send rows top-to-bottom (default).  "
+            "interlaced: send even rows first, then odd rows.  "
+            "interlaced-32: send all Group A rows (0-31 of each 64-row module), "
+            "then all Group B rows (32-63 of each module) - optimized for "
+            "32-line scan displays."
+        ),
+    )
+    parser.add_argument(
         "-p", "--pattern",
         default="rainbow",
         help=(
@@ -131,6 +144,7 @@ def main() -> int:
     print(f"Pattern : {args.pattern}")
     print(f"FPS     : {args.fps}")
     print(f"Bright  : {args.brightness}")
+    print(f"Scan    : {args.scan_mode}")
     print(f"NIC     : {args.interface}")
     print()
 
@@ -140,6 +154,7 @@ def main() -> int:
             width=args.width,
             height=args.height,
             brightness=args.brightness,
+            scan_mode=args.scan_mode,
         ) as driver:
             driver.stream(pattern.generate, fps=args.fps)
     except ValueError as exc:

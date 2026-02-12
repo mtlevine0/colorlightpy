@@ -202,3 +202,143 @@ def frame_to_packets(
             packets.append(build_row_packet(row, col_off, chunk, src_mac))
 
     return packets
+
+
+# ---------------------------------------------------------------------------
+# Pre-allocated packet builder (performance-optimized)
+# ---------------------------------------------------------------------------
+
+class PacketBuilder:
+    """Pre-allocates packet buffers for zero-copy frame transmission.
+
+    Reuses packet structure across frames, only updating RGB data.
+    """
+
+    def __init__(self, width: int, height: int, src_mac: bytes = SRC_MAC, scan_mode: str = "sequential"):
+        self.width = width
+        self.height = height
+        self.src_mac = src_mac
+        self.scan_mode = scan_mode
+
+        # Compute row sending order based on scan mode
+        if scan_mode == "interlaced":
+            # Send even rows first, then odd rows
+            self._row_order = list(range(0, height, 2)) + list(range(1, height, 2))
+        elif scan_mode == "interlaced-32":
+            # 32-line scan interlacing for 64-row modules
+            # Send all Group A rows (0-31 of each module), then all Group B rows (32-63)
+            module_height = 64
+            scan_lines = 32
+            num_modules = height // module_height
+
+            row_order = []
+            # All Group A rows (lines 0-31 of each 64-row module)
+            for module in range(num_modules):
+                for line in range(scan_lines):
+                    row_order.append(module * module_height + line)
+
+            # All Group B rows (lines 32-63 of each 64-row module)
+            for module in range(num_modules):
+                for line in range(scan_lines, module_height):
+                    row_order.append(module * module_height + line)
+
+            self._row_order = row_order
+        else:  # sequential
+            self._row_order = list(range(height))
+
+        # Pre-build packet templates with headers
+        self._packet_templates: List[bytearray] = []
+        self._raw_packets: List = []  # Pre-created Scapy Raw packets
+        self._rgb_offsets: List[int] = []
+        self._rgb_lengths: List[int] = []
+
+        # Lazy import scapy only when needed
+        from scapy.packet import Raw
+
+        # Build templates for each row
+        for row in range(height):
+            for col_off in range(0, width, MAX_COLS_PER_PACKET):
+                chunk_w = min(MAX_COLS_PER_PACKET, width - col_off)
+                rgb_len = chunk_w * 3
+
+                # Build template packet
+                pixel_count = chunk_w
+                ethertype = ETHERTYPE_DATA | ((row >> 8) & 0xFF)
+                header = _ether_header(ethertype, src_mac)
+
+                # Payload header: row_lo (1B) + offset (2B) + count (2B) + magic (2B)
+                payload_header = struct.pack(
+                    ">BHHH",
+                    row & 0xFF,
+                    col_off,
+                    pixel_count,
+                    0x0888,
+                )
+
+                # Create packet buffer with space for RGB data
+                packet = bytearray(header + payload_header + bytes(rgb_len))
+
+                # Pad to minimum frame length
+                if len(packet) < MIN_FRAME_LEN:
+                    packet.extend(bytes(MIN_FRAME_LEN - len(packet)))
+
+                self._packet_templates.append(packet)
+                self._rgb_offsets.append(len(header) + len(payload_header))
+                self._rgb_lengths.append(rgb_len)
+
+                # Pre-create Scapy Raw packet object (reuse across frames)
+                self._raw_packets.append(Raw(load=bytes(packet)))
+
+    def frame_to_packets_fast(self, frame: np.ndarray) -> List:
+        """Convert frame to packets using pre-allocated buffers.
+
+        Returns packets in scan_mode order (sequential or interlaced).
+
+        Parameters
+        ----------
+        frame : numpy.ndarray
+            Shape ``(height, width, 3)``, dtype ``uint8``, RGB order.
+
+        Returns
+        -------
+        list
+            Pre-created Scapy Raw packets with updated data, ordered by scan_mode.
+        """
+        packet_idx = 0
+
+        # First, update all packets in sequential order (matches allocation order)
+        for row in range(self.height):
+            # Get row as contiguous memory
+            row_data = np.ascontiguousarray(frame[row])
+            row_rgb = row_data.tobytes()
+
+            # Split into chunks
+            for col_off in range(0, self.width, MAX_COLS_PER_PACKET):
+                chunk_w = min(MAX_COLS_PER_PACKET, self.width - col_off)
+                rgb_len = chunk_w * 3
+
+                # Copy RGB data into pre-allocated packet buffer
+                template = self._packet_templates[packet_idx]
+                offset = self._rgb_offsets[packet_idx]
+
+                start = col_off * 3
+                template[offset:offset + rgb_len] = row_rgb[start:start + rgb_len]
+
+                # Update the pre-created Raw packet's load in place
+                self._raw_packets[packet_idx].load = bytes(template)
+
+                packet_idx += 1
+
+        # Then reorder packets based on scan_mode before returning
+        if self.scan_mode != "sequential":
+            # Reorder for interlaced or interlaced-32 modes
+            # Calculate packets per row (should be 1 for 384-wide display)
+            packets_per_row = len(self._raw_packets) // self.height
+            reordered = []
+            for row in self._row_order:
+                start_idx = row * packets_per_row
+                end_idx = start_idx + packets_per_row
+                reordered.extend(self._raw_packets[start_idx:end_idx])
+            return reordered
+        else:
+            return self._raw_packets

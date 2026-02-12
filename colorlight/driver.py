@@ -131,6 +131,7 @@ class ColorlightDriver:
         width: int = 192,
         height: int = 384,
         brightness: int = 255,
+        scan_mode: str = "sequential",
     ) -> None:
         self.width = width
         self.height = height
@@ -140,6 +141,13 @@ class ColorlightDriver:
         self._lock = threading.Lock()
         self._running = False
         self.src_mac = protocol.SRC_MAC
+        # Pre-allocate packet builder for fast frame conversion
+        self._packet_builder = protocol.PacketBuilder(
+            width, height, self.src_mac, scan_mode=scan_mode
+        )
+        # Pre-create sync and brightness Raw packets
+        self._sync_raw = None
+        self._brightness_raw = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -150,8 +158,18 @@ class ColorlightDriver:
         before streaming frame data.  We replicate that here.
         """
         from scapy.all import conf
+        from scapy.packet import Raw
 
         self._socket = conf.L2socket(iface=self._iface)
+
+        # Pre-create Raw packets for brightness and sync
+        brightness_pkt = protocol.build_brightness_packet(self.brightness, self.src_mac)
+        self._brightness_raw = Raw(load=brightness_pkt)
+
+        sync_pkt = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
+        self._sync_raw = Raw(load=sync_pkt)
+
+        # Initialization sequence
         self._send_brightness()
         self._send_sync()
         self._send_brightness()
@@ -175,7 +193,19 @@ class ColorlightDriver:
 
     def set_brightness(self, value: int) -> None:
         """Update display brightness (0–255) and send immediately."""
+        from scapy.packet import Raw
+
         self.brightness = max(0, min(255, value))
+
+        # Update pre-created Raw packets with new brightness
+        if self._brightness_raw is not None:
+            brightness_pkt = protocol.build_brightness_packet(self.brightness, self.src_mac)
+            self._brightness_raw.load = brightness_pkt
+
+        if self._sync_raw is not None:
+            sync_pkt = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
+            self._sync_raw.load = sync_pkt
+
         self._send_brightness()
 
     def send_frame(self, frame: np.ndarray) -> None:
@@ -192,13 +222,19 @@ class ColorlightDriver:
                 f"({self.height}, {self.width}, 3)"
             )
 
-        packets = protocol.frame_to_packets(
-            frame, self.width, self.height, self.src_mac,
-        )
-        packets.append(
-            protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
-        )
-        self._send_packets(packets)
+        # Match documented protocol order: brightness → row data → sync
+        # (See CLAUDE.md: "Per-frame send order: brightness (0x0A) → row data (0x55xx) → sync (0x0107)")
+        self._send_brightness()
+
+        # Use pre-allocated packet builder for faster conversion
+        # Returns pre-created Scapy Raw packets (not bytes)
+        raw_packets = self._packet_builder.frame_to_packets_fast(frame)
+
+        # Send all row packets
+        self._send_raw_packets(raw_packets)
+
+        # Send sync packet
+        self._send_sync()
 
     def stream(
         self,
@@ -222,14 +258,15 @@ class ColorlightDriver:
             Seconds to stream.  ``None`` means run forever.
         """
         interval = 1.0 / fps
-        brightness_period = 1.0
         fps_report_period = 5.0
 
         self._running = True
         start = time.perf_counter()
-        last_brightness = start
+        next_frame_time = start  # Track target time for next frame
         last_report = start
         frame_count = 0
+        total_gen_time = 0.0
+        total_send_time = 0.0
 
         print(
             f"Streaming {self.width}x{self.height} @ {fps} fps  "
@@ -238,35 +275,53 @@ class ColorlightDriver:
 
         try:
             while self._running:
-                t0 = time.perf_counter()
-                elapsed = t0 - start
+                loop_start = time.perf_counter()
+                elapsed = loop_start - start
 
                 if duration is not None and elapsed >= duration:
                     break
 
-                # Generate and send
+                # Generate and send frame (atomic operation - no interruptions)
+                t_gen_start = time.perf_counter()
                 frame = frame_fn(elapsed)
+                t_gen_end = time.perf_counter()
+
                 self.send_frame(frame)
+                t_send_end = time.perf_counter()
+
                 frame_count += 1
 
-                # Periodic brightness re-send
-                if t0 - last_brightness >= brightness_period:
-                    self._send_brightness()
-                    self._send_sync()
-                    last_brightness = t0
+                # Track timing for diagnostics
+                gen_time = (t_gen_end - t_gen_start) * 1000
+                send_time = (t_send_end - t_gen_end) * 1000
+                total_gen_time += gen_time
+                total_send_time += send_time
 
                 # FPS reporting
-                if t0 - last_report >= fps_report_period:
-                    actual = frame_count / (t0 - last_report)
-                    print(f"  {actual:.1f} fps  ({frame_count} frames)", file=sys.stderr)
+                if loop_start - last_report >= fps_report_period:
+                    actual = frame_count / (loop_start - last_report)
+                    avg_gen = total_gen_time / frame_count if frame_count > 0 else 0
+                    avg_send = total_send_time / frame_count if frame_count > 0 else 0
+                    print(
+                        f"  {actual:.1f} fps  ({frame_count} frames)  "
+                        f"gen={avg_gen:.2f}ms  send={avg_send:.2f}ms",
+                        file=sys.stderr
+                    )
                     frame_count = 0
-                    last_report = t0
+                    total_gen_time = 0.0
+                    total_send_time = 0.0
+                    last_report = loop_start
 
-                # Sleep remaining budget
-                t1 = time.perf_counter()
-                remaining = interval - (t1 - t0)
-                if remaining > 0:
-                    time.sleep(remaining)
+                # Drift-compensated timing: sleep until target time for next frame
+                next_frame_time += interval
+                now = time.perf_counter()
+                sleep_time = next_frame_time - now
+
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                elif sleep_time < -interval:
+                    # If we're more than one frame behind, resync to avoid runaway drift
+                    next_frame_time = now + interval
 
         except KeyboardInterrupt:
             print("\nStopped.")
@@ -280,22 +335,31 @@ class ColorlightDriver:
     # -- internals -----------------------------------------------------------
 
     def _send_packets(self, packets: List[bytes]) -> None:
+        """Send all packets with lock held for entire batch to prevent interruption."""
         from scapy.packet import Raw
 
         with self._lock:
             for pkt in packets:
                 self._socket.send(Raw(load=pkt))
 
-    def _send_brightness(self) -> None:
-        from scapy.packet import Raw
+    def _send_raw_packets(self, raw_packets: List) -> None:
+        """Send pre-created Scapy Raw packets (no wrapping overhead).
 
-        pkt = protocol.build_brightness_packet(self.brightness, self.src_mac)
+        Parameters
+        ----------
+        raw_packets : list
+            List of pre-created scapy.packet.Raw objects.
+        """
         with self._lock:
-            self._socket.send(Raw(load=pkt))
+            for pkt in raw_packets:
+                self._socket.send(pkt)
+
+    def _send_brightness(self) -> None:
+        """Send brightness packet using pre-created Raw object."""
+        with self._lock:
+            self._socket.send(self._brightness_raw)
 
     def _send_sync(self) -> None:
-        from scapy.packet import Raw
-
-        pkt = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
+        """Send sync packet using pre-created Raw object."""
         with self._lock:
-            self._socket.send(Raw(load=pkt))
+            self._socket.send(self._sync_raw)
