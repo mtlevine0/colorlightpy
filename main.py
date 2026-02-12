@@ -78,6 +78,11 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-s", "--speed",
+        type=float, default=1.0,
+        help="Pattern animation speed multiplier (default: 1.0).",
+    )
+    parser.add_argument(
         "-p", "--pattern",
         default="rainbow",
         help=(
@@ -142,6 +147,7 @@ def main() -> int:
 
     print(f"Display : {args.width} x {args.height}")
     print(f"Pattern : {args.pattern}")
+    print(f"Speed   : {args.speed}x")
     print(f"FPS     : {args.fps}")
     print(f"Bright  : {args.brightness}")
     print(f"Scan    : {args.scan_mode}")
@@ -156,7 +162,9 @@ def main() -> int:
             brightness=args.brightness,
             scan_mode=args.scan_mode,
         ) as driver:
-            driver.stream(pattern.generate, fps=args.fps)
+            speed = args.speed
+            frame_fn = (lambda t: pattern.generate(t * speed)) if speed != 1.0 else pattern.generate
+            driver.stream(frame_fn, fps=args.fps)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

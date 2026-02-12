@@ -46,7 +46,8 @@ colorlight/
 - **Sync/display frame:** EtherType `0x0107` — latches pixel buffer to display, carries brightness + per-channel colour temperature (R/G/B). Sent after each frame's row data.
 - **Fixed MACs:** dst `11:22:33:44:55:66`, src `22:22:33:44:55:66`
 - **Max 493 pixels per packet** (MTU constraint); wider rows are split into multiple packets
-- **Per-frame send order:** brightness (`0x0A`) → row data (`0x55xx`) → sync (`0x0107`)
+- **Row packets are sent twice** — each row data packet is transmitted back-to-back before advancing to the next row (matches vendor firmware behavior observed via Wireshark)
+- **Per-frame send order:** brightness (`0x0A`) → row data (`0x55xx`, each sent twice) → sync (`0x0107`)
 
 ### Adding a new test pattern
 

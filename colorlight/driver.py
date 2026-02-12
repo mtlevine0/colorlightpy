@@ -138,6 +138,7 @@ class ColorlightDriver:
         self.brightness = max(0, min(255, brightness))
         self._iface = resolve_interface(interface)
         self._socket = None
+        self._raw_send = None  # Low-level send bypassing scapy
         self._lock = threading.Lock()
         self._running = False
         self.src_mac = protocol.SRC_MAC
@@ -145,9 +146,9 @@ class ColorlightDriver:
         self._packet_builder = protocol.PacketBuilder(
             width, height, self.src_mac, scan_mode=scan_mode
         )
-        # Pre-create sync and brightness Raw packets
-        self._sync_raw = None
-        self._brightness_raw = None
+        # Pre-built brightness and sync packets (raw bytes)
+        self._brightness_bytes = None
+        self._sync_bytes = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -158,16 +159,20 @@ class ColorlightDriver:
         before streaming frame data.  We replicate that here.
         """
         from scapy.all import conf
-        from scapy.packet import Raw
 
         self._socket = conf.L2socket(iface=self._iface)
+        # Bypass scapy packet processing — send raw bytes directly via
+        # the underlying OS socket / pcap handle for minimal per-packet overhead.
+        # Linux L2Socket uses 'outs', Windows L2pcapSocket uses 'ins' for both directions.
+        _out = getattr(self._socket, 'outs', None) or getattr(self._socket, 'ins', None)
+        if _out is not None and hasattr(_out, 'send'):
+            self._raw_send = _out.send
+        else:
+            self._raw_send = self._socket.send
 
-        # Pre-create Raw packets for brightness and sync
-        brightness_pkt = protocol.build_brightness_packet(self.brightness, self.src_mac)
-        self._brightness_raw = Raw(load=brightness_pkt)
-
-        sync_pkt = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
-        self._sync_raw = Raw(load=sync_pkt)
+        # Pre-build brightness and sync as raw bytes
+        self._brightness_bytes = protocol.build_brightness_packet(self.brightness, self.src_mac)
+        self._sync_bytes = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
 
         # Initialization sequence
         self._send_brightness()
@@ -193,19 +198,9 @@ class ColorlightDriver:
 
     def set_brightness(self, value: int) -> None:
         """Update display brightness (0–255) and send immediately."""
-        from scapy.packet import Raw
-
         self.brightness = max(0, min(255, value))
-
-        # Update pre-created Raw packets with new brightness
-        if self._brightness_raw is not None:
-            brightness_pkt = protocol.build_brightness_packet(self.brightness, self.src_mac)
-            self._brightness_raw.load = brightness_pkt
-
-        if self._sync_raw is not None:
-            sync_pkt = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
-            self._sync_raw.load = sync_pkt
-
+        self._brightness_bytes = protocol.build_brightness_packet(self.brightness, self.src_mac)
+        self._sync_bytes = protocol.build_sync_packet(self.brightness, src_mac=self.src_mac)
         self._send_brightness()
 
     def send_frame(self, frame: np.ndarray) -> None:
@@ -226,12 +221,11 @@ class ColorlightDriver:
         # (See CLAUDE.md: "Per-frame send order: brightness (0x0A) → row data (0x55xx) → sync (0x0107)")
         self._send_brightness()
 
-        # Use pre-allocated packet builder for faster conversion
-        # Returns pre-created Scapy Raw packets (not bytes)
-        raw_packets = self._packet_builder.frame_to_packets_fast(frame)
+        # Build raw bytes packets (no scapy objects)
+        packets = self._packet_builder.frame_to_packets_fast(frame)
 
         # Send all row packets
-        self._send_raw_packets(raw_packets)
+        self._send_raw_packets(packets)
 
         # Send sync packet
         self._send_sync()
@@ -335,31 +329,39 @@ class ColorlightDriver:
     # -- internals -----------------------------------------------------------
 
     def _send_packets(self, packets: List[bytes]) -> None:
-        """Send all packets with lock held for entire batch to prevent interruption."""
-        from scapy.packet import Raw
+        """Send raw bytes packets directly on the underlying socket.
 
+        Each packet is sent twice to match vendor firmware behavior.
+        """
+        send = self._raw_send
         with self._lock:
             for pkt in packets:
-                self._socket.send(Raw(load=pkt))
+                send(pkt)
+                send(pkt)
 
-    def _send_raw_packets(self, raw_packets: List) -> None:
-        """Send pre-created Scapy Raw packets (no wrapping overhead).
+    def _send_raw_packets(self, packets: List[bytes]) -> None:
+        """Send raw bytes packets directly on the underlying socket.
+
+        Each packet is sent twice to match vendor firmware behavior
+        (observed via Wireshark).
 
         Parameters
         ----------
-        raw_packets : list
-            List of pre-created scapy.packet.Raw objects.
+        packets : list[bytes]
+            Raw Ethernet frame bytes.
         """
+        send = self._raw_send
         with self._lock:
-            for pkt in raw_packets:
-                self._socket.send(pkt)
+            for pkt in packets:
+                send(pkt)
+                send(pkt)
 
     def _send_brightness(self) -> None:
-        """Send brightness packet using pre-created Raw object."""
+        """Send brightness packet."""
         with self._lock:
-            self._socket.send(self._brightness_raw)
+            self._raw_send(self._brightness_bytes)
 
     def _send_sync(self) -> None:
-        """Send sync packet using pre-created Raw object."""
+        """Send sync packet."""
         with self._lock:
-            self._socket.send(self._sync_raw)
+            self._raw_send(self._sync_bytes)

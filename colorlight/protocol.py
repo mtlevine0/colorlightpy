@@ -248,12 +248,8 @@ class PacketBuilder:
 
         # Pre-build packet templates with headers
         self._packet_templates: List[bytearray] = []
-        self._raw_packets: List = []  # Pre-created Scapy Raw packets
         self._rgb_offsets: List[int] = []
         self._rgb_lengths: List[int] = []
-
-        # Lazy import scapy only when needed
-        from scapy.packet import Raw
 
         # Build templates for each row
         for row in range(height):
@@ -286,13 +282,11 @@ class PacketBuilder:
                 self._rgb_offsets.append(len(header) + len(payload_header))
                 self._rgb_lengths.append(rgb_len)
 
-                # Pre-create Scapy Raw packet object (reuse across frames)
-                self._raw_packets.append(Raw(load=bytes(packet)))
-
-    def frame_to_packets_fast(self, frame: np.ndarray) -> List:
+    def frame_to_packets_fast(self, frame: np.ndarray) -> List[bytes]:
         """Convert frame to packets using pre-allocated buffers.
 
-        Returns packets in scan_mode order (sequential or interlaced).
+        Returns raw bytes packets in scan_mode order, ready to be sent
+        directly on a raw socket (no scapy wrapping needed).
 
         Parameters
         ----------
@@ -301,44 +295,38 @@ class PacketBuilder:
 
         Returns
         -------
-        list
-            Pre-created Scapy Raw packets with updated data, ordered by scan_mode.
+        list[bytes]
+            Raw Ethernet frames ordered by scan_mode.
         """
+        templates = self._packet_templates
+        offsets = self._rgb_offsets
         packet_idx = 0
 
-        # First, update all packets in sequential order (matches allocation order)
+        # Update all packet templates with new RGB data (sequential order)
         for row in range(self.height):
-            # Get row as contiguous memory
             row_data = np.ascontiguousarray(frame[row])
             row_rgb = row_data.tobytes()
 
-            # Split into chunks
             for col_off in range(0, self.width, MAX_COLS_PER_PACKET):
                 chunk_w = min(MAX_COLS_PER_PACKET, self.width - col_off)
                 rgb_len = chunk_w * 3
 
-                # Copy RGB data into pre-allocated packet buffer
-                template = self._packet_templates[packet_idx]
-                offset = self._rgb_offsets[packet_idx]
+                template = templates[packet_idx]
+                offset = offsets[packet_idx]
 
                 start = col_off * 3
                 template[offset:offset + rgb_len] = row_rgb[start:start + rgb_len]
 
-                # Update the pre-created Raw packet's load in place
-                self._raw_packets[packet_idx].load = bytes(template)
-
                 packet_idx += 1
 
-        # Then reorder packets based on scan_mode before returning
+        # Return as bytes, reordered if needed
         if self.scan_mode != "sequential":
-            # Reorder for interlaced or interlaced-32 modes
-            # Calculate packets per row (should be 1 for 384-wide display)
-            packets_per_row = len(self._raw_packets) // self.height
-            reordered = []
+            packets_per_row = len(templates) // self.height
+            reordered: List[bytes] = []
             for row in self._row_order:
                 start_idx = row * packets_per_row
-                end_idx = start_idx + packets_per_row
-                reordered.extend(self._raw_packets[start_idx:end_idx])
+                for i in range(start_idx, start_idx + packets_per_row):
+                    reordered.append(bytes(templates[i]))
             return reordered
         else:
-            return self._raw_packets
+            return [bytes(t) for t in templates]
