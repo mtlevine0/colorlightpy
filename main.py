@@ -27,6 +27,55 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
+
+
+def _read_frame_from_stdin(width: int, height: int, frame_buffer) -> bool:
+    """Read one raw RGB frame from stdin into the provided buffer.
+
+    Parameters
+    ----------
+    width : int
+        Frame width in pixels.
+    height : int
+        Frame height in pixels.
+    frame_buffer : np.ndarray
+        Pre-allocated buffer of shape (height, width, 3), dtype uint8.
+
+    Returns
+    -------
+    bool
+        True if frame was successfully read, False on EOF.
+
+    Raises
+    ------
+    ValueError
+        If incomplete frame received before EOF.
+    """
+    expected_bytes = width * height * 3
+    data = bytearray()
+
+    # Read exactly expected_bytes, handling partial reads
+    while len(data) < expected_bytes:
+        remaining = expected_bytes - len(data)
+        chunk = sys.stdin.buffer.read(remaining)
+
+        if not chunk:
+            # EOF reached
+            if len(data) == 0:
+                return False  # Clean EOF, no data read yet
+            else:
+                raise ValueError(
+                    f"Incomplete frame: expected {expected_bytes} bytes, "
+                    f"got {len(data)} bytes before EOF"
+                )
+
+        data.extend(chunk)
+
+    # Copy into numpy buffer (reshape from flat bytes)
+    import numpy as np
+    np.copyto(frame_buffer, np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3)))
+    return True
 
 
 def _parse_args() -> argparse.Namespace:
@@ -90,6 +139,14 @@ def _parse_args() -> argparse.Namespace:
             "rainbow, diagonal, bars, bounce, solid  (default: rainbow)."
         ),
     )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help=(
+            "Read raw RGB frames from stdin instead of using a pattern.  "
+            "Expects continuous stream of WIDTH * HEIGHT * 3 bytes per frame (RGB order)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -134,50 +191,141 @@ def main() -> int:
         )
         return 1
 
-    if args.pattern not in PATTERNS:
-        print(
-            f"Unknown pattern '{args.pattern}'.  "
-            f"Choose from: {', '.join(PATTERNS)}",
-            file=sys.stderr,
-        )
-        return 1
+    # Validate pattern if not using stdin
+    if not args.stdin:
+        if args.pattern not in PATTERNS:
+            print(
+                f"Unknown pattern '{args.pattern}'.  "
+                f"Choose from: {', '.join(PATTERNS)}",
+                file=sys.stderr,
+            )
+            return 1
 
-    # Build pattern and driver
-    pattern = PATTERNS[args.pattern](args.width, args.height)
+    if args.stdin:
+        # Stdin mode: read raw RGB frames from stdin
+        import numpy as np
 
-    print(f"Display : {args.width} x {args.height}")
-    print(f"Pattern : {args.pattern}")
-    print(f"Speed   : {args.speed}x")
-    print(f"FPS     : {args.fps}")
-    print(f"Bright  : {args.brightness}")
-    print(f"Scan    : {args.scan_mode}")
-    print(f"NIC     : {args.interface}")
-    print()
+        frame_buffer = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+        frame_count = 0
 
-    try:
-        with ColorlightDriver(
-            interface=args.interface,
-            width=args.width,
-            height=args.height,
-            brightness=args.brightness,
-            scan_mode=args.scan_mode,
-        ) as driver:
-            speed = args.speed
-            frame_fn = (lambda t: pattern.generate(t * speed)) if speed != 1.0 else pattern.generate
-            driver.stream(frame_fn, fps=args.fps)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"Network error: {exc}", file=sys.stderr)
-        print(
-            "Make sure Npcap is installed and you have permission "
-            "to send raw packets (try running as Administrator).",
-            file=sys.stderr,
-        )
-        return 1
+        print(f"Display : {args.width} x {args.height}")
+        print(f"Mode    : stdin (raw RGB)")
+        print(f"FPS     : {args.fps}")
+        print(f"Bright  : {args.brightness}")
+        print(f"Scan    : {args.scan_mode}")
+        print(f"NIC     : {args.interface}")
+        print()
 
-    return 0
+        try:
+            with ColorlightDriver(
+                interface=args.interface,
+                width=args.width,
+                height=args.height,
+                brightness=args.brightness,
+                scan_mode=args.scan_mode,
+            ) as driver:
+                interval = 1.0 / args.fps
+                fps_report_period = 5.0
+
+                start = time.perf_counter()
+                next_frame_time = start
+                last_report = start
+                report_frame_count = 0
+
+                print(
+                    f"Streaming {args.width}x{args.height} @ {args.fps} fps  "
+                    f"(brightness={args.brightness})  — Reading from stdin..."
+                )
+
+                while True:
+                    loop_start = time.perf_counter()
+
+                    # Read frame from stdin (blocking)
+                    try:
+                        if not _read_frame_from_stdin(args.width, args.height, frame_buffer):
+                            # Clean EOF
+                            print(f"\nEOF reached after {frame_count} frames.")
+                            break
+                    except ValueError as exc:
+                        print(f"\nError: {exc}", file=sys.stderr)
+                        return 1
+
+                    # Send frame to display
+                    driver.send_frame(frame_buffer)
+                    frame_count += 1
+                    report_frame_count += 1
+
+                    # FPS reporting
+                    if loop_start - last_report >= fps_report_period:
+                        actual = report_frame_count / (loop_start - last_report)
+                        print(
+                            f"  {actual:.1f} fps  ({frame_count} total frames)",
+                            file=sys.stderr
+                        )
+                        report_frame_count = 0
+                        last_report = loop_start
+
+                    # Rate limiting to match target FPS
+                    next_frame_time += interval
+                    now = time.perf_counter()
+                    sleep_time = next_frame_time - now
+
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    elif sleep_time < -interval:
+                        # If more than one frame behind, resync
+                        next_frame_time = now + interval
+
+        except KeyboardInterrupt:
+            print(f"\nStopped after {frame_count} frames.")
+        except OSError as exc:
+            print(f"Network error: {exc}", file=sys.stderr)
+            print(
+                "Make sure Npcap is installed and you have permission "
+                "to send raw packets (try running as Administrator).",
+                file=sys.stderr,
+            )
+            return 1
+
+        return 0
+
+    else:
+        # Pattern mode: use built-in test patterns
+        pattern = PATTERNS[args.pattern](args.width, args.height)
+
+        print(f"Display : {args.width} x {args.height}")
+        print(f"Pattern : {args.pattern}")
+        print(f"Speed   : {args.speed}x")
+        print(f"FPS     : {args.fps}")
+        print(f"Bright  : {args.brightness}")
+        print(f"Scan    : {args.scan_mode}")
+        print(f"NIC     : {args.interface}")
+        print()
+
+        try:
+            with ColorlightDriver(
+                interface=args.interface,
+                width=args.width,
+                height=args.height,
+                brightness=args.brightness,
+                scan_mode=args.scan_mode,
+            ) as driver:
+                speed = args.speed
+                frame_fn = (lambda t: pattern.generate(t * speed)) if speed != 1.0 else pattern.generate
+                driver.stream(frame_fn, fps=args.fps)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"Network error: {exc}", file=sys.stderr)
+            print(
+                "Make sure Npcap is installed and you have permission "
+                "to send raw packets (try running as Administrator).",
+                file=sys.stderr,
+            )
+            return 1
+
+        return 0
 
 
 if __name__ == "__main__":

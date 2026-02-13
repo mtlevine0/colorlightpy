@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colorlightpy"
+version = "0.1.0"
+description = "Python driver for streaming RGB frames to Colorlight 5A-75B LED receiver cards"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "scapy>=2.5.0",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+colorlight = "main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["colorlight*"]
