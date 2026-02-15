@@ -1,33 +1,30 @@
+#!/bin/bash
+# Create pipe
+rm /tmp/video_pipe
+mkfifo /tmp/video_pipe
+
+# Start receiver
 source .venv/bin/activate
-# # # while true; do
-# # socat -u PIPE:/tmp/mypipe STDOUT | python main.py --stdin -i enp12s0 -W 384 -H 192 --fps 27 --stdin-timeout 1.0
+sudo .venv/bin/python main.py stream --pipe /tmp/video_pipe -i enp12s0 -W 384 -H 192 --fps 30 --pixel-format bgr &
+RECEIVER_PID=$!
 
-# PIPE=/tmp/mypipe
-# mkfifo -m 666 "$PIPE" 2>/dev/null
+# Wait for receiver to be ready
+sleep 1
 
-# while true; do
-#     echo "Waiting for writer..."
+VIDEO=$1
+START_TIME=$2
 
-#     # This blocks until a writer connects
-#     cat "$PIPE" | python main.py --stdin -i enp12s0 -W 384 -H 192 --fps 27 --stdin-timeout 2.0
+# Start both ffmpeg processes at the same time
+{
+    ffmpeg -y -re -ss $START_TIME -stream_loop -1 -i $VIDEO -an -vf scale=384:192 -f rawvideo -pix_fmt rgb24 /tmp/video_pipe &
+    VIDEO_PID=$!
+    
+    ffmpeg -re -ss $START_TIME -stream_loop -1 -i $VIDEO -vn -f pulse default &
+    AUDIO_PID=$!
+    
+    wait $VIDEO_PID $AUDIO_PID
+}
 
-#     echo "Writer disconnected. Restarting..."
-#     sleep 2.0
-# done
-
-#!/usr/bin/env bash
-
-PIPE=/tmp/mypipe
-mkfifo -m 666 "$PIPE" 2>/dev/null
-
-trap 'break' INT TERM
-
-while true; do
-    echo "Waiting for writer..."
-    cat "$PIPE" | python main.py --stdin -i enp12s0 -W 384 -H 192 --fps 27 --stdin-timeout 0.1 --no-signal-threshold 200
-    echo "Writer disconnected. Restarting..."
-    sleep 0.2
-done
-
-echo "Shutting down..."
-rm -f "$PIPE"
+# Cleanup
+kill $RECEIVER_PID
+rm /tmp/video_pipe

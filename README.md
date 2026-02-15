@@ -18,13 +18,19 @@ pip install -r requirements.txt
 
 ```bash
 # List available network interfaces
-python main.py --list-interfaces
+python main.py interfaces
 
 # Stream a scrolling rainbow at 30 fps
-python main.py -i Ethernet -W 192 -H 384 --fps 30 -p rainbow
+python main.py pattern rainbow -i Ethernet -W 192 -H 384 --fps 30
 
 # Static colour bars at full brightness
-python main.py -i Ethernet -p bars -b 255
+python main.py pattern bars -i Ethernet -b 255
+
+# Stream from stdin
+python main.py stream -i Ethernet -W 192 -H 384 --fps 30
+
+# Stream from named pipe
+python main.py stream --pipe /tmp/colorlight.fifo -i Ethernet
 ```
 
 ## License

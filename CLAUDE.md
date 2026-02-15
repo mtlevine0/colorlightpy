@@ -13,8 +13,9 @@ pip install -r requirements.txt
 # Windows: also install Npcap from https://npcap.com
 # May need Administrator/root for raw socket access
 
-python main.py --list-interfaces
-python main.py -i Ethernet -W 192 -H 384 --fps 30 -p rainbow
+python main.py interfaces
+python main.py pattern rainbow -i Ethernet -W 192 -H 384 --fps 30
+python main.py stream -i Ethernet  # Stream from stdin
 ```
 
 No test framework, linter, or build step is configured — this is a pure Python project.
@@ -52,7 +53,7 @@ colorlight/
 
 1. Subclass `Pattern` in `patterns.py`, implement `generate(t: float) -> np.ndarray` returning `(height, width, 3)` uint8 RGB
 2. Add an entry to the `PATTERNS` dict at the bottom of `patterns.py`
-3. The CLI picks it up automatically via the `-p` flag
+3. The CLI picks it up automatically via the `pattern` subcommand
 
 ## Dependencies
 
