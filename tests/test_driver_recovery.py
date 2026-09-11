@@ -78,3 +78,34 @@ def test_recover_rejects_zero_repeats():
         assert str(exc) == "frame_repeats must be at least 1"
     else:
         raise AssertionError("recover accepted zero repeats")
+
+
+def test_prepare_for_sleep_blanks_once_and_blocks_new_frames(monkeypatch):
+    driver = ColorlightDriver.__new__(ColorlightDriver)
+    driver.width = 3
+    driver.height = 2
+    driver._lock = driver_module.threading.RLock()
+    driver._socket = object()
+    driver._suspend_requested = False
+    calls = []
+
+    def send_frame(frame, *, force=False):
+        calls.append((frame, force))
+
+    monkeypatch.setattr(driver, "send_frame", send_frame)
+
+    driver._handle_prepare_for_sleep(True)
+
+    assert driver._suspend_requested is True
+    assert len(calls) == 1
+    assert calls[0][1] is True
+    assert calls[0][0].shape == (2, 3, 3)
+    assert not calls[0][0].any()
+
+    # Normal stream writes are suppressed until logind announces wake-up.
+    ColorlightDriver.send_frame(driver, np.zeros((2, 3, 3), dtype=np.uint8))
+    assert len(calls) == 1
+
+    driver._handle_prepare_for_sleep(False)
+    assert driver._suspend_requested is False
+    assert len(calls) == 1

@@ -11,6 +11,7 @@ requires-python = ">=3.8"
 dependencies = [
     "scapy>=2.5.0",
     "numpy>=1.21.0",
+    "dbus-next>=0.2.3; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

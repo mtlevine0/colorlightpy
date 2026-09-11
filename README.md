@@ -33,6 +33,12 @@ python main.py stream -i Ethernet -W 192 -H 384 --fps 30
 python main.py stream --pipe /tmp/colorlight.fifo -i Ethernet
 ```
 
+## Suspend behavior (Linux)
+
+On systems running systemd-logind, the driver listens for logind's
+`PrepareForSleep(true)` D-Bus signal and sends a black frame before the host
+suspends.  It continues to detect and reinitialize the receiver after resume.
+
 ## License
 
 [MIT](LICENSE)

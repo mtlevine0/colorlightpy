@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from . import protocol
+from .sleep_monitor import LogindSleepMonitor
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +141,13 @@ class ColorlightDriver:
         self.brightness = max(0, min(255, brightness))
         self._iface = resolve_interface(interface)
         self._socket = None
-        self._lock = threading.Lock()
+        # Frame sends are also performed by the logind listener.  An RLock
+        # makes a complete frame atomic while allowing the low-level helpers
+        # to retain their own locking contract.
+        self._lock = threading.RLock()
         self._running = False
+        self._suspend_requested = False
+        self._sleep_monitor = LogindSleepMonitor(self._handle_prepare_for_sleep)
         self.src_mac = protocol.SRC_MAC
         # Pre-allocate packet builder for fast frame conversion
         self._packet_builder = protocol.PacketBuilder(
@@ -197,6 +203,7 @@ class ColorlightDriver:
         self._send_sync()
         self._send_brightness()
         self._send_sync()
+        self._sleep_monitor.start()
         return self
 
     def resume_detected(self, threshold: float = 1.0) -> bool:
@@ -312,6 +319,7 @@ class ColorlightDriver:
     def close(self) -> None:
         """Stop any running stream and close the socket."""
         self._running = False
+        self._sleep_monitor.stop()
         if self._socket is not None:
             self._socket.close()
             self._socket = None
@@ -341,7 +349,19 @@ class ColorlightDriver:
 
         self._send_brightness()
 
-    def send_frame(self, frame: np.ndarray) -> None:
+    def _handle_prepare_for_sleep(self, sleeping: bool) -> None:
+        """Blank the receiver after logind announces an imminent suspend."""
+        with self._lock:
+            self._suspend_requested = sleeping
+            if not sleeping or self._socket is None:
+                return
+
+            print("Host is suspending; blanking Colorlight output", file=sys.stderr)
+            self.send_frame(
+                np.zeros((self.height, self.width, 3), dtype=np.uint8), force=True
+            )
+
+    def send_frame(self, frame: np.ndarray, *, force: bool = False) -> None:
         """Send a single frame to the display.
 
         Parameters
@@ -349,25 +369,28 @@ class ColorlightDriver:
         frame : numpy.ndarray
             Shape ``(height, width, 3)``, dtype ``uint8``, RGB order.
         """
-        if frame.shape != (self.height, self.width, 3):
-            raise ValueError(
-                f"Frame shape {frame.shape} != expected "
-                f"({self.height}, {self.width}, 3)"
-            )
+        with self._lock:
+            if self._suspend_requested and not force:
+                return
+            if frame.shape != (self.height, self.width, 3):
+                raise ValueError(
+                    f"Frame shape {frame.shape} != expected "
+                    f"({self.height}, {self.width}, 3)"
+                )
 
-        # Match documented protocol order: brightness → row data → sync
-        # (See CLAUDE.md: "Per-frame send order: brightness (0x0A) → row data (0x55xx) → sync (0x0107)")
-        self._send_brightness()
+            # Match documented protocol order: brightness → row data → sync
+            # (See CLAUDE.md: "Per-frame send order: brightness (0x0A) → row data (0x55xx) → sync (0x0107)")
+            self._send_brightness()
 
-        # Use pre-allocated packet builder for faster conversion
-        # Returns pre-created Scapy Raw packets (not bytes)
-        raw_packets = self._packet_builder.frame_to_packets_fast(frame)
+            # Use pre-allocated packet builder for faster conversion
+            # Returns pre-created Scapy Raw packets (not bytes)
+            raw_packets = self._packet_builder.frame_to_packets_fast(frame)
 
-        # Send all row packets
-        self._send_raw_packets(raw_packets)
+            # Send all row packets
+            self._send_raw_packets(raw_packets)
 
-        # Send sync packet
-        self._send_sync()
+            # Send sync packet
+            self._send_sync()
 
     def stream(
         self,
