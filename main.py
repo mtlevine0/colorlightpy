@@ -104,6 +104,8 @@ def _handle_interfaces(list_interfaces_fn) -> int:
 
 def _handle_pattern(args, ColorlightDriver, PATTERNS) -> int:
     """Handle 'pattern' subcommand - display built-in test patterns."""
+    import numpy as np
+
     # Validate pattern
     if args.pattern_name not in PATTERNS:
         print(
@@ -133,9 +135,14 @@ def _handle_pattern(args, ColorlightDriver, PATTERNS) -> int:
             brightness=args.brightness,
             scan_mode=args.scan_mode,
         ) as driver:
-            speed = args.speed
-            frame_fn = (lambda t: pattern.generate(t * speed)) if speed != 1.0 else pattern.generate
-            driver.stream(frame_fn, fps=args.fps)
+            try:
+                speed = args.speed
+                frame_fn = (lambda t: pattern.generate(t * speed)) if speed != 1.0 else pattern.generate
+                driver.stream(frame_fn, fps=args.fps)
+            finally:
+                # Send blank frame to clear display before exit
+                blank_frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+                driver.send_frame(blank_frame)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -179,101 +186,107 @@ def _handle_stream_stdin(args, ColorlightDriver, PATTERNS) -> int:
             brightness=args.brightness,
             scan_mode=args.scan_mode,
         ) as driver:
-            interval = 1.0 / args.fps
-            fps_report_period = 5.0
+            try:
+                interval = 1.0 / args.fps
+                fps_report_period = 5.0
 
-            start = time.perf_counter()
-            next_frame_time = start
-            last_report = start
-            report_frame_count = 0
+                start = time.perf_counter()
+                next_frame_time = start
+                last_report = start
+                report_frame_count = 0
 
-            print(
-                f"Streaming {args.width}x{args.height} @ {args.fps} fps  "
-                f"(brightness={args.brightness})  — Waiting for stdin data..."
-            )
+                print(
+                    f"Streaming {args.width}x{args.height} @ {args.fps} fps  "
+                    f"(brightness={args.brightness})  — Waiting for stdin data..."
+                )
 
-            while True:
-                loop_start = time.perf_counter()
-                elapsed = loop_start - start
+                while True:
+                    loop_start = time.perf_counter()
+                    elapsed = loop_start - start
 
-                if not has_signal:
-                    # Display no-signal pattern until first frame arrives
-                    no_signal_frame = no_signal_pattern.generate(elapsed)
-                    driver.send_frame(no_signal_frame)
+                    if not has_signal:
+                        # Display no-signal pattern until first frame arrives
+                        no_signal_frame = no_signal_pattern.generate(elapsed)
+                        driver.send_frame(no_signal_frame)
 
-                    # Try to read the first frame
-                    try:
-                        frame_read = _read_frame_from_stdin(args.width, args.height, frame_buffer)
-                        if frame_read:
-                            has_signal = True
-                            print("Signal acquired - displaying live feed", file=sys.stderr)
-                            # Display the first frame we just read
-                            # Swap R and B channels if BGR format
-                            display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                            if driver.resume_detected():
-                                print(
-                                    "Host resumed; reinitializing Colorlight output",
-                                    file=sys.stderr,
-                                )
-                                driver.recover(display_frame)
+                        # Try to read the first frame
+                        try:
+                            frame_read = _read_frame_from_stdin(args.width, args.height, frame_buffer)
+                            if frame_read:
+                                has_signal = True
+                                print("Signal acquired - displaying live feed", file=sys.stderr)
+                                # Display the first frame we just read
+                                # Swap R and B channels if BGR format
+                                display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
+                                if driver.resume_detected():
+                                    print(
+                                        "Host resumed; reinitializing Colorlight output",
+                                        file=sys.stderr,
+                                    )
+                                    driver.recover(display_frame)
+                                else:
+                                    driver.send_frame(display_frame)
+                                frame_count += 1
+                                report_frame_count += 1
+                        except ValueError as exc:
+                            print(f"\nError reading first frame: {exc}", file=sys.stderr)
+                            # Keep showing no-signal on error before first frame
+                    else:
+                        # We have signal - read and display frames
+                        try:
+                            frame_read = _read_frame_from_stdin(args.width, args.height, frame_buffer)
+
+                            if frame_read:
+                                # Swap R and B channels if BGR format
+                                display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
+                                if driver.resume_detected():
+                                    print(
+                                        "Host resumed; reinitializing Colorlight output",
+                                        file=sys.stderr,
+                                    )
+                                    driver.recover(display_frame)
+                                else:
+                                    driver.send_frame(display_frame)
+                                frame_count += 1
+                                report_frame_count += 1
                             else:
-                                driver.send_frame(display_frame)
-                            frame_count += 1
-                            report_frame_count += 1
-                    except ValueError as exc:
-                        print(f"\nError reading first frame: {exc}", file=sys.stderr)
-                        # Keep showing no-signal on error before first frame
-                else:
-                    # We have signal - read and display frames
-                    try:
-                        frame_read = _read_frame_from_stdin(args.width, args.height, frame_buffer)
+                                # EOF reached - exit cleanly
+                                print(f"\nEOF reached after {frame_count} frames.", file=sys.stderr)
+                                break
 
-                        if frame_read:
-                            # Swap R and B channels if BGR format
-                            display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                            if driver.resume_detected():
-                                print(
-                                    "Host resumed; reinitializing Colorlight output",
-                                    file=sys.stderr,
-                                )
-                                driver.recover(display_frame)
-                            else:
-                                driver.send_frame(display_frame)
-                            frame_count += 1
-                            report_frame_count += 1
-                        else:
-                            # EOF reached - exit cleanly
-                            print(f"\nEOF reached after {frame_count} frames.", file=sys.stderr)
-                            break
+                        except ValueError as exc:
+                            # Error reading frame - log and exit
+                            print(f"\nError reading frame: {exc}", file=sys.stderr)
+                            return 1
 
-                    except ValueError as exc:
-                        # Error reading frame - log and exit
-                        print(f"\nError reading frame: {exc}", file=sys.stderr)
-                        return 1
+                    # FPS reporting (only for live frames)
+                    if has_signal and loop_start - last_report >= fps_report_period:
+                        actual = report_frame_count / (loop_start - last_report)
+                        print(
+                            f"  {actual:.1f} fps  ({frame_count} total frames)",
+                            file=sys.stderr
+                        )
+                        report_frame_count = 0
+                        last_report = loop_start
 
-                # FPS reporting (only for live frames)
-                if has_signal and loop_start - last_report >= fps_report_period:
-                    actual = report_frame_count / (loop_start - last_report)
-                    print(
-                        f"  {actual:.1f} fps  ({frame_count} total frames)",
-                        file=sys.stderr
-                    )
-                    report_frame_count = 0
-                    last_report = loop_start
+                    # Rate limiting to match target FPS
+                    next_frame_time += interval
+                    now = time.perf_counter()
+                    sleep_time = next_frame_time - now
 
-                # Rate limiting to match target FPS
-                next_frame_time += interval
-                now = time.perf_counter()
-                sleep_time = next_frame_time - now
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    elif sleep_time < -interval:
+                        # If more than one frame behind, resync
+                        next_frame_time = now + interval
 
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                elif sleep_time < -interval:
-                    # If more than one frame behind, resync
-                    next_frame_time = now + interval
+            except KeyboardInterrupt:
+                print(f"\nStopped after {frame_count} frames.")
+            finally:
+                # Send blank frame to clear display before exit
+                blank_frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+                driver.send_frame(blank_frame)
 
-    except KeyboardInterrupt:
-        print(f"\nStopped after {frame_count} frames.")
     except OSError as exc:
         print(f"Network error: {exc}", file=sys.stderr)
         print(
@@ -324,120 +337,127 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
             brightness=args.brightness,
             scan_mode=args.scan_mode,
         ) as driver:
-            interval = 1.0 / args.fps
-            fps_report_period = 5.0
+            try:
+                interval = 1.0 / args.fps
+                fps_report_period = 5.0
 
-            start = time.perf_counter()
-            next_frame_time = start
-            last_report = start
-            report_frame_count = 0
+                start = time.perf_counter()
+                next_frame_time = start
+                last_report = start
+                report_frame_count = 0
 
-            pipe_fd = None
+                pipe_fd = None
 
-            print(f"Waiting for writer to connect to {args.pipe}...")
+                print(f"Waiting for writer to connect to {args.pipe}...")
 
-            while True:
-                loop_start = time.perf_counter()
-                elapsed = loop_start - start
+                while True:
+                    loop_start = time.perf_counter()
+                    elapsed = loop_start - start
 
-                # Open pipe if not already open
-                if pipe_fd is None:
-                    # Show no-signal pattern during disconnection
-                    no_signal_frame = no_signal_pattern.generate(elapsed)
-                    driver.send_frame(no_signal_frame)
+                    # Open pipe if not already open
+                    if pipe_fd is None:
+                        # Show no-signal pattern during disconnection
+                        no_signal_frame = no_signal_pattern.generate(elapsed)
+                        driver.send_frame(no_signal_frame)
 
+                        try:
+                            pipe_fd = open(args.pipe, 'rb', buffering=0)
+                            if not has_signal:
+                                print("Writer connected", file=sys.stderr)
+                            else:
+                                print("Writer reconnected", file=sys.stderr)
+                        except (OSError, IOError):
+                            # Can't open pipe yet
+                            time.sleep(0.1)
+                            continue
+
+                    # Try to read frame from pipe
                     try:
-                        pipe_fd = open(args.pipe, 'rb', buffering=0)
-                        if not has_signal:
-                            print("Writer connected", file=sys.stderr)
-                        else:
-                            print("Writer reconnected", file=sys.stderr)
-                    except (OSError, IOError):
-                        # Can't open pipe yet
-                        time.sleep(0.1)
+                        # Read frame from pipe
+                        expected_bytes = args.width * args.height * 3
+                        data = bytearray()
+
+                        while len(data) < expected_bytes:
+                            remaining = expected_bytes - len(data)
+                            chunk = pipe_fd.read(remaining)
+
+                            if not chunk:
+                                # EOF - writer disconnected
+                                if len(data) == 0:
+                                    print("Writer disconnected - waiting for reconnection...", file=sys.stderr)
+                                    pipe_fd.close()
+                                    pipe_fd = None
+                                    # Don't reset has_signal - keep showing last frame
+                                    break
+                                else:
+                                    raise ValueError(
+                                        f"Incomplete frame: expected {expected_bytes} bytes, "
+                                        f"got {len(data)} bytes before EOF"
+                                    )
+
+                            data.extend(chunk)
+
+                        if len(data) == expected_bytes:
+                            # Successfully read full frame
+                            np.copyto(frame_buffer, np.frombuffer(data, dtype=np.uint8).reshape((args.height, args.width, 3)))
+
+                            if not has_signal:
+                                print("Signal acquired - displaying live feed", file=sys.stderr)
+                                has_signal = True
+
+                            # Swap R and B channels if BGR format
+                            display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
+                            if driver.resume_detected():
+                                print(
+                                    "Host resumed; reinitializing Colorlight output",
+                                    file=sys.stderr,
+                                )
+                                driver.recover(display_frame)
+                            else:
+                                driver.send_frame(display_frame)
+                            frame_count += 1
+                            report_frame_count += 1
+
+                    except ValueError as exc:
+                        print(f"Error reading from pipe: {exc} - will retry", file=sys.stderr)
+                        if pipe_fd:
+                            pipe_fd.close()
+                            pipe_fd = None
+                        continue
+                    except (OSError, IOError) as exc:
+                        print(f"Pipe read error: {exc} - will retry", file=sys.stderr)
+                        if pipe_fd:
+                            pipe_fd.close()
+                            pipe_fd = None
                         continue
 
-                # Try to read frame from pipe
-                try:
-                    # Read frame from pipe
-                    expected_bytes = args.width * args.height * 3
-                    data = bytearray()
+                    # FPS reporting
+                    if has_signal and loop_start - last_report >= fps_report_period:
+                        actual = report_frame_count / (loop_start - last_report)
+                        print(f"  {actual:.1f} fps  ({frame_count} total frames)", file=sys.stderr)
+                        report_frame_count = 0
+                        last_report = loop_start
 
-                    while len(data) < expected_bytes:
-                        remaining = expected_bytes - len(data)
-                        chunk = pipe_fd.read(remaining)
+                    # Rate limiting
+                    next_frame_time += interval
+                    now = time.perf_counter()
+                    sleep_time = next_frame_time - now
 
-                        if not chunk:
-                            # EOF - writer disconnected
-                            if len(data) == 0:
-                                print("Writer disconnected - waiting for reconnection...", file=sys.stderr)
-                                pipe_fd.close()
-                                pipe_fd = None
-                                # Don't reset has_signal - keep showing last frame
-                                break
-                            else:
-                                raise ValueError(
-                                    f"Incomplete frame: expected {expected_bytes} bytes, "
-                                    f"got {len(data)} bytes before EOF"
-                                )
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    elif sleep_time < -interval:
+                        next_frame_time = now + interval
 
-                        data.extend(chunk)
+            except KeyboardInterrupt:
+                print(f"\nStopped after {frame_count} frames.")
+            finally:
+                # Clean up pipe file descriptor and send blank frame
+                if pipe_fd:
+                    pipe_fd.close()
+                # Send blank frame to clear display before exit
+                blank_frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+                driver.send_frame(blank_frame)
 
-                    if len(data) == expected_bytes:
-                        # Successfully read full frame
-                        np.copyto(frame_buffer, np.frombuffer(data, dtype=np.uint8).reshape((args.height, args.width, 3)))
-
-                        if not has_signal:
-                            print("Signal acquired - displaying live feed", file=sys.stderr)
-                            has_signal = True
-
-                        # Swap R and B channels if BGR format
-                        display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                        if driver.resume_detected():
-                            print(
-                                "Host resumed; reinitializing Colorlight output",
-                                file=sys.stderr,
-                            )
-                            driver.recover(display_frame)
-                        else:
-                            driver.send_frame(display_frame)
-                        frame_count += 1
-                        report_frame_count += 1
-
-                except ValueError as exc:
-                    print(f"Error reading from pipe: {exc} - will retry", file=sys.stderr)
-                    if pipe_fd:
-                        pipe_fd.close()
-                        pipe_fd = None
-                    continue
-                except (OSError, IOError) as exc:
-                    print(f"Pipe read error: {exc} - will retry", file=sys.stderr)
-                    if pipe_fd:
-                        pipe_fd.close()
-                        pipe_fd = None
-                    continue
-
-                # FPS reporting
-                if has_signal and loop_start - last_report >= fps_report_period:
-                    actual = report_frame_count / (loop_start - last_report)
-                    print(f"  {actual:.1f} fps  ({frame_count} total frames)", file=sys.stderr)
-                    report_frame_count = 0
-                    last_report = loop_start
-
-                # Rate limiting
-                next_frame_time += interval
-                now = time.perf_counter()
-                sleep_time = next_frame_time - now
-
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                elif sleep_time < -interval:
-                    next_frame_time = now + interval
-
-    except KeyboardInterrupt:
-        print(f"\nStopped after {frame_count} frames.")
-        if pipe_fd:
-            pipe_fd.close()
     except OSError as exc:
         print(f"Network error: {exc}", file=sys.stderr)
         print(
@@ -445,8 +465,6 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
             "to send raw packets (try running as Administrator).",
             file=sys.stderr,
         )
-        if pipe_fd:
-            pipe_fd.close()
         return 1
 
     return 0
