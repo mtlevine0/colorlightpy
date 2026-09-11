@@ -34,6 +34,7 @@ Stream with BGR pixel format::
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import time
 
@@ -201,6 +202,8 @@ def _handle_stream_stdin(args, ColorlightDriver, PATTERNS) -> int:
                 )
 
                 while True:
+                    _check_shutdown()  # safe point: no frame send in flight
+
                     loop_start = time.perf_counter()
                     elapsed = loop_start - start
 
@@ -351,6 +354,8 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
                 print(f"Waiting for writer to connect to {args.pipe}...")
 
                 while True:
+                    _check_shutdown()  # safe point: no frame send in flight
+
                     loop_start = time.perf_counter()
                     elapsed = loop_start - start
 
@@ -361,7 +366,18 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
                         driver.send_frame(no_signal_frame)
 
                         try:
-                            pipe_fd = open(args.pipe, 'rb', buffering=0)
+                            # open() blocks here until a writer connects --
+                            # could be indefinitely, if the orchestrator
+                            # stays down. No frame send is in flight during
+                            # that wait, so it's safe to arm the immediate
+                            # (non-deferred) handler just for this call, or
+                            # a stop would otherwise hang until systemd's
+                            # TimeoutStopSec escalates to SIGKILL.
+                            signal.signal(signal.SIGTERM, _interrupt_immediate)
+                            try:
+                                pipe_fd = open(args.pipe, 'rb', buffering=0)
+                            finally:
+                                signal.signal(signal.SIGTERM, _interrupt)
                             if not has_signal:
                                 print("Writer connected", file=sys.stderr)
                             else:
@@ -603,8 +619,54 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+_shutdown_requested = False
+
+
+def _interrupt(signum, frame):
+    """Ask the stream loop to shut down at its next safe point.
+
+    systemd's default stop signal is SIGTERM, and Python's default
+    disposition for it is immediate termination -- no ``finally`` block
+    runs, and no blank/no-signal frame ever gets sent. That's the first
+    problem this fixes.
+
+    The second, subtler one: raising KeyboardInterrupt directly from a
+    signal handler (an earlier version of this fix did exactly that) fires
+    asynchronously -- between arbitrary bytecode instructions, including
+    mid-syscall. ``ColorlightDriver.send_frame()`` sends a frame as a burst
+    of individual row-packet sends (see driver.py), so an interrupt landing
+    there leaves a torn frame latched on the receiver, no better than an
+    untranslated SIGTERM. Setting a flag here instead, and only converting
+    it to KeyboardInterrupt via ``_check_shutdown()`` between frames (never
+    inside a frame send), keeps every ``send_frame()`` call atomic.
+    """
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+def _check_shutdown() -> None:
+    """Raise KeyboardInterrupt if a deferred SIGTERM is pending.
+
+    Call only between frames -- see ``_interrupt()`` for why.
+    """
+    if _shutdown_requested:
+        raise KeyboardInterrupt
+
+
+def _interrupt_immediate(signum, frame):
+    """Interrupt right away, no deferral.
+
+    Armed only around a blocking call known to have no frame send in
+    flight (waiting for a pipe writer to connect) -- there, an immediate
+    raise is safe and desirable, so a stop doesn't hang until the writer
+    reconnects or systemd's TimeoutStopSec escalates to SIGKILL.
+    """
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     args = _parse_args()
+    signal.signal(signal.SIGTERM, _interrupt)
 
     # Defer heavy imports so --help is instant
     try:
