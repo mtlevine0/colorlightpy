@@ -373,6 +373,19 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
                             # (non-deferred) handler just for this call, or
                             # a stop would otherwise hang until systemd's
                             # TimeoutStopSec escalates to SIGKILL.
+                            #
+                            # A SIGTERM can also land during the
+                            # send_frame() call just above, while still
+                            # under the deferred handler -- that only sets
+                            # the flag, doesn't raise, and systemd sends
+                            # SIGTERM once, so arming _interrupt_immediate
+                            # after the fact would never see a fresh signal
+                            # to catch: the process would hang in open()
+                            # until forcibly SIGKILLed (confirmed live:
+                            # systemd's default 90s TimeoutStopSec elapsed,
+                            # then killed it). Check the flag here, before
+                            # arming, to close that window.
+                            _check_shutdown()
                             signal.signal(signal.SIGTERM, _interrupt_immediate)
                             try:
                                 pipe_fd = open(args.pipe, 'rb', buffering=0)
