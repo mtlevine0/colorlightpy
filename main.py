@@ -210,7 +210,14 @@ def _handle_stream_stdin(args, ColorlightDriver, PATTERNS) -> int:
                             # Display the first frame we just read
                             # Swap R and B channels if BGR format
                             display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                            driver.send_frame(display_frame)
+                            if driver.resume_detected():
+                                print(
+                                    "Host resumed; reinitializing Colorlight output",
+                                    file=sys.stderr,
+                                )
+                                driver.recover(display_frame)
+                            else:
+                                driver.send_frame(display_frame)
                             frame_count += 1
                             report_frame_count += 1
                     except ValueError as exc:
@@ -224,7 +231,14 @@ def _handle_stream_stdin(args, ColorlightDriver, PATTERNS) -> int:
                         if frame_read:
                             # Swap R and B channels if BGR format
                             display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                            driver.send_frame(display_frame)
+                            if driver.resume_detected():
+                                print(
+                                    "Host resumed; reinitializing Colorlight output",
+                                    file=sys.stderr,
+                                )
+                                driver.recover(display_frame)
+                            else:
+                                driver.send_frame(display_frame)
                             frame_count += 1
                             report_frame_count += 1
                         else:
@@ -379,7 +393,14 @@ def _handle_stream_pipe(args, ColorlightDriver, PATTERNS) -> int:
 
                         # Swap R and B channels if BGR format
                         display_frame = frame_buffer[:, :, [2, 1, 0]] if args.pixel_format == "bgr" else frame_buffer
-                        driver.send_frame(display_frame)
+                        if driver.resume_detected():
+                            print(
+                                "Host resumed; reinitializing Colorlight output",
+                                file=sys.stderr,
+                            )
+                            driver.recover(display_frame)
+                        else:
+                            driver.send_frame(display_frame)
                         frame_count += 1
                         report_frame_count += 1
 

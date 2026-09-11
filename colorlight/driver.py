@@ -6,6 +6,8 @@ frame transmission, and an FPS-controlled streaming loop.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import time
 import threading
@@ -149,6 +151,18 @@ class ColorlightDriver:
         self._sync_raw = None
         self._brightness_raw = None
 
+        # CLOCK_BOOTTIME advances while Linux is suspended, whereas
+        # monotonic/perf_counter does not.  Comparing the two lets a daemon
+        # notice resume without depending on a desktop session or D-Bus.
+        if hasattr(time, "CLOCK_BOOTTIME"):
+            self._resume_clock = lambda: time.clock_gettime(time.CLOCK_BOOTTIME)
+        else:
+            # Portable fallback.  A large wall-clock adjustment can cause a
+            # harmless extra recovery on platforms without CLOCK_BOOTTIME.
+            self._resume_clock = time.time
+        self._last_resume_clock = self._resume_clock()
+        self._last_monotonic = time.monotonic()
+
     # -- lifecycle -----------------------------------------------------------
 
     def open(self) -> "ColorlightDriver":
@@ -160,6 +174,15 @@ class ColorlightDriver:
         from scapy.all import conf
         from scapy.packet import Raw
 
+        # A Colorlight receiver expects a gigabit link.  Some Realtek NICs
+        # occasionally resume at 100 Mbps/half duplex; packets still appear to
+        # send successfully in that state, but the receiver remains frozen.
+        self._keep_link_awake()
+        self._wait_for_link()
+
+        # Make open idempotent so it can also be used after suspend.
+        if self._socket is not None:
+            self._socket.close()
         self._socket = conf.L2socket(iface=self._iface)
 
         # Pre-create Raw packets for brightness and sync
@@ -175,6 +198,116 @@ class ColorlightDriver:
         self._send_brightness()
         self._send_sync()
         return self
+
+    def resume_detected(self, threshold: float = 1.0) -> bool:
+        """Return True once after the host resumes from a significant sleep.
+
+        ``threshold`` is the minimum time spent suspended.  The clock samples
+        are always advanced, so a single resume only triggers one recovery.
+        """
+        resume_now = self._resume_clock()
+        monotonic_now = time.monotonic()
+        suspended_for = (
+            (resume_now - self._last_resume_clock)
+            - (monotonic_now - self._last_monotonic)
+        )
+        self._last_resume_clock = resume_now
+        self._last_monotonic = monotonic_now
+        return suspended_for >= threshold
+
+    def recover(self, frame: np.ndarray, frame_repeats: int = 3) -> None:
+        """Reopen the L2 socket, reinitialize the receiver, and replay a frame.
+
+        Colorlight's protocol has no acknowledgement.  Repeating a complete
+        frame makes recovery robust when the NIC and receiver are settling
+        immediately after resume.
+        """
+        if frame_repeats < 1:
+            raise ValueError("frame_repeats must be at least 1")
+
+        self.open()
+        for _ in range(frame_repeats):
+            self.send_frame(frame)
+
+    def _wait_for_link(self, timeout: float = 5.0, minimum_speed: int = 1000) -> None:
+        """Wait for carrier and a usable Linux Ethernet link.
+
+        If the link negotiates below ``minimum_speed``, ask the driver to
+        restart autonegotiation.  This requires ``CAP_NET_ADMIN`` when running
+        as a systemd service.
+        """
+        if not sys.platform.startswith("linux"):
+            return
+
+        interface = getattr(self, "_iface", None)
+        if not isinstance(interface, str):
+            return
+        carrier_path = f"/sys/class/net/{os.path.basename(interface)}/carrier"
+        speed_path = f"/sys/class/net/{os.path.basename(interface)}/speed"
+        if not os.path.exists(carrier_path):
+            return
+
+        deadline = time.monotonic() + timeout
+        renegotiated = False
+        last_speed = None
+        while time.monotonic() < deadline:
+            try:
+                with open(carrier_path, "r", encoding="ascii") as carrier_file:
+                    has_carrier = carrier_file.read().strip() == "1"
+                if has_carrier:
+                    with open(speed_path, "r", encoding="ascii") as speed_file:
+                        last_speed = int(speed_file.read().strip())
+                    if last_speed >= minimum_speed:
+                        return
+
+                    if not renegotiated:
+                        subprocess.run(
+                            [
+                                "/usr/sbin/ethtool",
+                                "--change",
+                                interface,
+                                "autoneg",
+                                "on",
+                                "advertise",
+                                "0x020",  # 1000baseT/Full only
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        renegotiated = True
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        detail = "no carrier" if last_speed is None else f"{last_speed} Mbps"
+        print(
+            f"Warning: {interface} did not establish a {minimum_speed} Mbps "
+            f"link within {timeout:g}s (last state: {detail}); continuing "
+            "without restarting the display service",
+            file=sys.stderr,
+        )
+
+    def _keep_link_awake(self) -> None:
+        """Ask a Linux NIC to retain PHY power across system suspend."""
+        if not sys.platform.startswith("linux"):
+            return
+        interface = getattr(self, "_iface", None)
+        if not isinstance(interface, str):
+            return
+
+        try:
+            subprocess.run(
+                ["/usr/sbin/ethtool", "--change", interface, "wol", "g"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"Warning: could not enable Wake-on-LAN for {interface}: {exc}",
+                file=sys.stderr,
+            )
 
     def close(self) -> None:
         """Stop any running stream and close the socket."""
@@ -286,7 +419,11 @@ class ColorlightDriver:
                 frame = frame_fn(elapsed)
                 t_gen_end = time.perf_counter()
 
-                self.send_frame(frame)
+                if self.resume_detected():
+                    print("Host resumed; reinitializing Colorlight output", file=sys.stderr)
+                    self.recover(frame)
+                else:
+                    self.send_frame(frame)
                 t_send_end = time.perf_counter()
 
                 frame_count += 1
