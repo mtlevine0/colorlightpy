@@ -113,6 +113,87 @@ def test_prepare_for_sleep_repeats_blank_and_blocks_new_frames(monkeypatch):
     assert len(calls) == 3
 
 
+def _sleeping_driver(monkeypatch, calls):
+    """A driver wired up far enough to run the suspend handler."""
+    driver = ColorlightDriver.__new__(ColorlightDriver)
+    driver.width = 3
+    driver.height = 2
+    driver._lock = driver_module.threading.RLock()
+    driver._socket = object()
+    driver._suspend_requested = False
+    monkeypatch.setattr(
+        driver, "send_frame",
+        lambda frame, *, force=False: calls.append(("send", force)))
+    monkeypatch.setattr(
+        driver, "_wait_for_link",
+        lambda timeout=None: calls.append(("link", timeout)))
+    monkeypatch.setattr(
+        driver_module.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+    return driver
+
+
+def test_prepare_for_sleep_waits_for_the_link_before_blanking(monkeypatch):
+    """A blank fired into a down or 100 Mbps link is silently swallowed.
+
+    open() already refuses to stream until the link is back at gigabit, for
+    exactly this reason; the suspend path used to skip that check and send
+    anyway, which is how the wall stayed lit through a suspend.
+    """
+    calls = []
+    driver = _sleeping_driver(monkeypatch, calls)
+
+    driver._handle_prepare_for_sleep(True)
+
+    assert calls[0] == ("link", ColorlightDriver.SUSPEND_LINK_TIMEOUT)
+    assert [name for name, _ in calls].count("send") == 3
+    # Well inside logind's 5s InhibitDelayMaxSec, which is all that holds the
+    # host up while this runs.
+    budget = (ColorlightDriver.SUSPEND_LINK_TIMEOUT
+              + 2 * ColorlightDriver.SUSPEND_BLANK_SPACING)
+    assert budget < 5.0
+
+
+def test_prepare_for_sleep_spaces_the_repeats(monkeypatch):
+    """Back-to-back repeats all land in the same instant and die together."""
+    calls = []
+    driver = _sleeping_driver(monkeypatch, calls)
+
+    driver._handle_prepare_for_sleep(True)
+
+    sends = [index for index, (name, _) in enumerate(calls) if name == "send"]
+    sleeps = [index for index, (name, _) in enumerate(calls) if name == "sleep"]
+    assert len(sends) == 3
+    # A pause between each pair of sends, and none before the first: the point
+    # is to straddle the settling window, not to delay the suspend.
+    assert len(sleeps) == 2
+    assert sends[0] < sleeps[0] < sends[1] < sleeps[1] < sends[2]
+    assert all(
+        seconds == ColorlightDriver.SUSPEND_BLANK_SPACING
+        for name, seconds in calls if name == "sleep"
+    )
+
+
+def test_resume_neither_waits_nor_blanks(monkeypatch):
+    calls = []
+    driver = _sleeping_driver(monkeypatch, calls)
+    driver._suspend_requested = True
+
+    driver._handle_prepare_for_sleep(False)
+
+    assert driver._suspend_requested is False
+    assert calls == []
+
+
+def test_prepare_for_sleep_without_a_socket_does_nothing(monkeypatch):
+    calls = []
+    driver = _sleeping_driver(monkeypatch, calls)
+    driver._socket = None
+
+    driver._handle_prepare_for_sleep(True)
+
+    assert calls == []
+
+
 def test_prepare_for_sleep_repeats_configurable(monkeypatch):
     driver = ColorlightDriver.__new__(ColorlightDriver)
     driver.width = 1

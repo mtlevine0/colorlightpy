@@ -349,26 +349,52 @@ class ColorlightDriver:
 
         self._send_brightness()
 
+    # logind's InhibitDelayMaxSec is 5s by default, and the delay inhibitor the
+    # sleep monitor holds is the only thing keeping the host up while this
+    # runs. Both budgets together stay well inside that.
+    SUSPEND_LINK_TIMEOUT = 1.5
+    SUSPEND_BLANK_SPACING = 0.1
+
     def _handle_prepare_for_sleep(self, sleeping: bool, frame_repeats: int = 3) -> None:
         """Blank the receiver after logind announces an imminent suspend.
 
-        Colorlight's protocol has no acknowledgement, and the NIC can
-        already be mid-renegotiation right as suspend begins (the same
-        settling that ``recover()`` repeats a frame for on the resume side
-        -- see its docstring). A single send here can silently never reach
-        the receiver, leaving whatever was last on screen showing through
-        the whole suspend instead of black. Repeat it for the same reason
-        ``recover()`` does.
+        This is the *only* blanking that reaches the panels. Setting
+        ``_suspend_requested`` below makes ``send_frame()`` drop everything
+        arriving from the stream, so from this moment nothing upstream can
+        blank the wall on this process's behalf -- a black frame written into
+        the pipe by the orchestrator is discarded like any other.
+
+        Colorlight's protocol has no acknowledgement, and the NIC can already
+        be mid-renegotiation right as suspend begins (the same settling that
+        ``recover()`` repeats a frame for on the resume side -- see its
+        docstring). A single send here can silently never reach the receiver,
+        leaving whatever was last on screen showing through the whole suspend
+        instead of black.
+
+        Repeating is not enough on its own, though, and repeating alone is
+        what left the wall lit: sends issued back to back all land in the same
+        instant, so a link that is down -- or has dropped to 100 Mbps, where
+        ``open()`` notes packets still *appear* to send while the receiver
+        stays frozen -- swallows every one of them. So wait for a usable link
+        first, exactly as the resume path does via ``open()``, then space the
+        repeats across the settling window instead of firing them together.
         """
         with self._lock:
             self._suspend_requested = sleeping
             if not sleeping or self._socket is None:
                 return
-
             print("Host is suspending; blanking Colorlight output", file=sys.stderr)
-            blank = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            for _ in range(frame_repeats):
-                self.send_frame(blank, force=True)
+
+        # Deliberately outside the lock: this waits on the NIC, and a
+        # streaming thread only needs the lock long enough to notice the
+        # suspend and drop its frame.
+        self._wait_for_link(timeout=self.SUSPEND_LINK_TIMEOUT)
+
+        blank = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        for repeat in range(frame_repeats):
+            if repeat:
+                time.sleep(self.SUSPEND_BLANK_SPACING)
+            self.send_frame(blank, force=True)
 
     def send_frame(self, frame: np.ndarray, *, force: bool = False) -> None:
         """Send a single frame to the display.
