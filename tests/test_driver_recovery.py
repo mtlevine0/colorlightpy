@@ -80,7 +80,7 @@ def test_recover_rejects_zero_repeats():
         raise AssertionError("recover accepted zero repeats")
 
 
-def test_prepare_for_sleep_blanks_once_and_blocks_new_frames(monkeypatch):
+def test_prepare_for_sleep_repeats_blank_and_blocks_new_frames(monkeypatch):
     driver = ColorlightDriver.__new__(ColorlightDriver)
     driver.width = 3
     driver.height = 2
@@ -96,16 +96,33 @@ def test_prepare_for_sleep_blanks_once_and_blocks_new_frames(monkeypatch):
 
     driver._handle_prepare_for_sleep(True)
 
+    # Repeated like recover()'s frame_repeats, and for the same reason: the
+    # protocol has no acknowledgement, and a single send can be lost while
+    # the NIC is still settling right as suspend begins.
     assert driver._suspend_requested is True
-    assert len(calls) == 1
-    assert calls[0][1] is True
-    assert calls[0][0].shape == (2, 3, 3)
-    assert not calls[0][0].any()
+    assert len(calls) == 3
+    assert all(force is True for _, force in calls)
+    assert all(frame.shape == (2, 3, 3) and not frame.any() for frame, _ in calls)
 
     # Normal stream writes are suppressed until logind announces wake-up.
     ColorlightDriver.send_frame(driver, np.zeros((2, 3, 3), dtype=np.uint8))
-    assert len(calls) == 1
+    assert len(calls) == 3
 
     driver._handle_prepare_for_sleep(False)
     assert driver._suspend_requested is False
+    assert len(calls) == 3
+
+
+def test_prepare_for_sleep_repeats_configurable(monkeypatch):
+    driver = ColorlightDriver.__new__(ColorlightDriver)
+    driver.width = 1
+    driver.height = 1
+    driver._lock = driver_module.threading.RLock()
+    driver._socket = object()
+    driver._suspend_requested = False
+    calls = []
+    monkeypatch.setattr(driver, "send_frame", lambda frame, *, force=False: calls.append(force))
+
+    driver._handle_prepare_for_sleep(True, frame_repeats=1)
+
     assert len(calls) == 1

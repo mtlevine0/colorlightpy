@@ -349,17 +349,26 @@ class ColorlightDriver:
 
         self._send_brightness()
 
-    def _handle_prepare_for_sleep(self, sleeping: bool) -> None:
-        """Blank the receiver after logind announces an imminent suspend."""
+    def _handle_prepare_for_sleep(self, sleeping: bool, frame_repeats: int = 3) -> None:
+        """Blank the receiver after logind announces an imminent suspend.
+
+        Colorlight's protocol has no acknowledgement, and the NIC can
+        already be mid-renegotiation right as suspend begins (the same
+        settling that ``recover()`` repeats a frame for on the resume side
+        -- see its docstring). A single send here can silently never reach
+        the receiver, leaving whatever was last on screen showing through
+        the whole suspend instead of black. Repeat it for the same reason
+        ``recover()`` does.
+        """
         with self._lock:
             self._suspend_requested = sleeping
             if not sleeping or self._socket is None:
                 return
 
             print("Host is suspending; blanking Colorlight output", file=sys.stderr)
-            self.send_frame(
-                np.zeros((self.height, self.width, 3), dtype=np.uint8), force=True
-            )
+            blank = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            for _ in range(frame_repeats):
+                self.send_frame(blank, force=True)
 
     def send_frame(self, frame: np.ndarray, *, force: bool = False) -> None:
         """Send a single frame to the display.
